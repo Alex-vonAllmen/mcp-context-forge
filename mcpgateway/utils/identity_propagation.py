@@ -86,7 +86,8 @@ def build_identity_headers(
         gateway: Optional gateway DB object or cached gateway payload dict for per-gateway config overrides.
 
     Returns:
-        Dict of HTTP headers to merge into the outbound request.
+        Dict of HTTP headers to merge into the outbound request. Empty when
+        propagation is disabled or the resolved mode is ``meta``.
 
     Examples:
         >>> from mcpgateway.transports.context import UserContext
@@ -96,7 +97,7 @@ def build_identity_headers(
         True
     """
     cfg = _resolve_config(gateway)
-    if not cfg["enabled"]:
+    if not cfg["enabled"] or cfg["mode"] == "meta":
         return {}
 
     prefix = cfg["headers_prefix"]
@@ -145,7 +146,9 @@ def build_identity_meta(
         gateway: Optional gateway DB object or cached gateway payload dict for per-gateway config overrides.
 
     Returns:
-        Updated _meta dict with user identity under the ``user`` key.
+        Updated _meta dict with user identity under the ``user`` key. The
+        existing ``_meta`` unchanged when propagation is disabled or the
+        resolved mode is ``headers``.
 
     Examples:
         >>> from mcpgateway.transports.context import UserContext
@@ -155,7 +158,7 @@ def build_identity_meta(
         'val'
     """
     cfg = _resolve_config(gateway)
-    if not cfg["enabled"]:
+    if not cfg["enabled"] or cfg["mode"] == "headers":
         return existing_meta or {}
 
     meta = dict(existing_meta) if existing_meta else {}
