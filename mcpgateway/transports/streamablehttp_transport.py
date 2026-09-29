@@ -2046,6 +2046,7 @@ async def call_tool(
                 request_state=inbound_request_state,
                 plugin_global_context=plugin_global_context,
                 plugin_context_table=plugin_context_table,
+                user_identity=_user_identity_from_dict(user_context),
             )
             if not result or not result.content:
                 logger.warning("No content returned by tool: %s", name)
@@ -5260,27 +5261,50 @@ class SessionManagerWrapper:
 # ------------------------- Authentication for /mcp routes ------------------------------
 
 
+def _user_identity_from_dict(ctx: Optional[dict[str, Any]]) -> Optional[UserContext]:
+    """Build a UserContext from the transport user_context dict.
+
+    Args:
+        ctx: User context dictionary with email, is_admin, teams, auth_method keys.
+
+    Returns:
+        The caller's UserContext, or ``None`` when the dict carries no email.
+
+    Examples:
+        >>> _user_identity_from_dict({"email": "alice@example.com", "teams": ["t1"]}).user_id
+        'alice@example.com'
+        >>> _user_identity_from_dict({}) is None
+        True
+        >>> _user_identity_from_dict(None) is None
+        True
+        >>> _user_identity_from_dict({"email": None, "auth_method": "anonymous"}) is None
+        True
+    """
+    # Standard
+    from datetime import datetime, timezone  # pylint: disable=import-outside-toplevel
+
+    email = ctx.get("email") if isinstance(ctx, dict) else None
+    if not email:
+        return None
+    return UserContext(
+        user_id=email,
+        email=email,
+        is_admin=ctx.get("is_admin", False),
+        teams=ctx.get("teams"),
+        auth_method=ctx.get("auth_method", "bearer"),
+        authenticated_at=datetime.now(timezone.utc),
+    )
+
+
 def _set_user_identity_from_dict(ctx: dict[str, Any]) -> None:
     """Build a UserContext from the user_context dict and store it in user_identity_var.
 
     Args:
         ctx: User context dictionary with email, is_admin, teams, auth_method keys.
     """
-    # Standard
-    from datetime import datetime, timezone  # pylint: disable=import-outside-toplevel
-
-    email = ctx.get("email")
-    if email:
-        user_identity_var.set(
-            UserContext(
-                user_id=email,
-                email=email,
-                is_admin=ctx.get("is_admin", False),
-                teams=ctx.get("teams"),
-                auth_method=ctx.get("auth_method", "bearer"),
-                authenticated_at=datetime.now(timezone.utc),
-            )
-        )
+    identity = _user_identity_from_dict(ctx)
+    if identity is not None:
+        user_identity_var.set(identity)
 
 
 async def _set_proxy_user_context(proxy_user: str) -> dict[str, Any] | None:

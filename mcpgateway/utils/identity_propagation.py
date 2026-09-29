@@ -21,7 +21,7 @@ Examples:
 import hashlib
 import hmac
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 # First-Party
 from mcpgateway.config import settings
@@ -36,12 +36,22 @@ def _resolve_config(gateway: Optional[Any] = None) -> Dict[str, Any]:
     Per-gateway config overrides global settings when present.
 
     Args:
-        gateway: Optional gateway DB object with ``identity_propagation`` JSON field.
+        gateway: Optional gateway DB object, or the cached gateway payload dict,
+            carrying an ``identity_propagation`` JSON field.
 
     Returns:
         Resolved configuration dict.
+
+    Examples:
+        >>> _resolve_config({"identity_propagation": {"enabled": True, "mode": "headers"}})["mode"]
+        'headers'
+        >>> _resolve_config({"identity_propagation": None})["enabled"] == settings.identity_propagation_enabled
+        True
     """
-    gw_cfg = getattr(gateway, "identity_propagation", None) or {} if gateway else {}
+    if isinstance(gateway, Mapping):
+        gw_cfg = gateway.get("identity_propagation") or {}
+    else:
+        gw_cfg = getattr(gateway, "identity_propagation", None) or {} if gateway else {}
     return {
         "enabled": gw_cfg.get("enabled", settings.identity_propagation_enabled),
         "mode": gw_cfg.get("mode", settings.identity_propagation_mode),
@@ -73,7 +83,7 @@ def build_identity_headers(
 
     Args:
         user_context: The authenticated user's identity.
-        gateway: Optional gateway DB object for per-gateway config overrides.
+        gateway: Optional gateway DB object or cached gateway payload dict for per-gateway config overrides.
 
     Returns:
         Dict of HTTP headers to merge into the outbound request.
@@ -132,7 +142,7 @@ def build_identity_meta(
     Args:
         user_context: The authenticated user's identity.
         existing_meta: Existing _meta dict to merge into.
-        gateway: Optional gateway DB object for per-gateway config overrides.
+        gateway: Optional gateway DB object or cached gateway payload dict for per-gateway config overrides.
 
     Returns:
         Updated _meta dict with user identity under the ``user`` key.

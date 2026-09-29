@@ -188,14 +188,19 @@ def _apply_tool_payload_to_global_context(
     tool_gateway_id: Optional[str],
     app_user_email: Optional[str],
     payload_tenant_id: Optional[str],
+    user_identity: Optional[UserContext] = None,
 ) -> None:
     """Enrich an existing GlobalContext with tool-payload-derived values without overwriting.
 
-    Populates server_id, user, and tenant_id on a GlobalContext that was
-    supplied by the plugin manager / middleware — filling gaps the upstream
-    propagation did not cover while never overwriting a value that was
-    already set there. Shared by the two tool-invocation call sites so they
-    stay in lockstep.
+    Populates server_id, user, tenant_id, and user_context on a GlobalContext
+    that was supplied by the plugin manager / middleware — filling gaps the
+    upstream propagation did not cover while never overwriting a value that
+    was already set there. Shared by the two tool-invocation call sites so
+    they stay in lockstep.
+
+    ``user_context`` feeds identity propagation to upstream servers. A
+    transport whose authentication path leaves it unset, such as trusted-proxy
+    authentication on ``/mcp``, supplies it through ``user_identity``.
     """
     if tool_gateway_id and isinstance(tool_gateway_id, str):
         global_context.server_id = tool_gateway_id
@@ -203,6 +208,8 @@ def _apply_tool_payload_to_global_context(
         global_context.user = app_user_email
     if not global_context.tenant_id and payload_tenant_id:
         global_context.tenant_id = payload_tenant_id
+    if global_context.user_context is None and user_identity is not None:
+        global_context.user_context = user_identity
 
 
 def _is_valid_w3c_traceparent(traceparent: str) -> bool:
@@ -1391,6 +1398,7 @@ class ToolService(BaseService):
                 "visibility": gateway.visibility,
                 "tags": gateway.tags or [],
                 "gateway_mode": getattr(gateway, "gateway_mode", "cache"),  # Gateway mode for direct proxy support
+                "identity_propagation": getattr(gateway, "identity_propagation", None),
                 "client_cert": getattr(gateway, "client_cert", None),
                 "client_key": getattr(gateway, "client_key", None),
                 "auth_value": getattr(gateway, "auth_value", None),
@@ -4601,6 +4609,7 @@ class ToolService(BaseService):
                     "ca_certificate_sig": gateway.ca_certificate_sig,
                     "passthrough_headers": gateway.passthrough_headers,
                     "gateway_mode": gateway.gateway_mode,
+                    "identity_propagation": getattr(gateway, "identity_propagation", None),
                 }
                 tool_payload = {
                     "id": None,
@@ -5439,6 +5448,7 @@ class ToolService(BaseService):
                     "ca_certificate_sig": gateway.ca_certificate_sig,
                     "passthrough_headers": gateway.passthrough_headers,
                     "gateway_mode": gateway.gateway_mode,
+                    "identity_propagation": getattr(gateway, "identity_propagation", None),
                 }
                 # Create minimal tool payload for direct proxy (no DB tool needed)
                 tool_payload = {
@@ -5643,6 +5653,7 @@ class ToolService(BaseService):
         allow_input_required: bool = False,
         input_responses: Optional[Any] = None,
         request_state: Optional[str] = None,
+        user_identity: Optional[UserContext] = None,
     ) -> ToolResult:
         """
         Invoke a registered tool and record execution metrics.
@@ -5678,6 +5689,9 @@ class ToolService(BaseService):
                 is surfaced via ToolInputRequired instead of failing the call.
             input_responses: Client answers to a prior InputRequiredResult, forwarded upstream.
             request_state: Opaque state echoed from a prior InputRequiredResult, forwarded upstream.
+            user_identity: Authenticated caller identity for identity propagation to upstream
+                servers. Fills ``GlobalContext.user_context`` when the plugin global context
+                does not already carry one.
 
         Returns:
             Tool invocation result.
@@ -5931,14 +5945,21 @@ class ToolService(BaseService):
 
         if plugin_global_context:
             global_context = plugin_global_context
-            _apply_tool_payload_to_global_context(global_context, tool_gateway_id, app_user_email, payload_tenant_id)
+            _apply_tool_payload_to_global_context(global_context, tool_gateway_id, app_user_email, payload_tenant_id, user_identity)
         else:
             # Create new context (fallback when middleware didn't run)
             # Use correlation ID from context if available, otherwise generate new one
             request_id = get_correlation_id() or uuid.uuid4().hex
             context_server_id = tool_gateway_id if tool_gateway_id and isinstance(tool_gateway_id, str) else "unknown"
             content_type = request_headers.get("content-type") if request_headers else None
-            global_context = GlobalContext(request_id=request_id, server_id=context_server_id, tenant_id=payload_tenant_id, user=app_user_email, content_type=content_type)
+            global_context = GlobalContext(
+                request_id=request_id,
+                server_id=context_server_id,
+                tenant_id=payload_tenant_id,
+                user=app_user_email,
+                user_context=user_identity,
+                content_type=content_type,
+            )
 
         # Per-invocation accumulator for CPEX control-execution telemetry.
         # Declared here (before the try/with block) so it survives into the
@@ -6563,8 +6584,9 @@ class ToolService(BaseService):
 
                     # Inject identity propagation headers and meta for MCP tools
                     if global_context and global_context.user_context:
-                        headers.update(build_identity_headers(global_context.user_context))
-                        meta_data = build_identity_meta(global_context.user_context, meta_data)
+                        identity_gateway = gateway_payload if has_gateway else None
+                        headers.update(build_identity_headers(global_context.user_context, identity_gateway))
+                        meta_data = build_identity_meta(global_context.user_context, meta_data, identity_gateway)
 
                     # mTLS client cert/key: resolve from payload, then override with runtime gateway if available
                     client_cert_from_payload = gateway_payload.get("client_cert") if has_gateway else None
