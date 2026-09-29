@@ -2485,3 +2485,92 @@ class TestStreamableCallToolForwardsIdentity:
         await transport.call_tool("mytool", {})
 
         assert invoke.call_args.kwargs["user_identity"] is None
+
+
+# ---------------------------------------------------------------------------
+# IDENTITY_PROPAGATION_MODE selects the channel identity travels on
+# ---------------------------------------------------------------------------
+def _mode_settings(mock_settings, mode):
+    mock_settings.identity_propagation_enabled = True
+    mock_settings.identity_propagation_mode = mode
+    mock_settings.identity_propagation_headers_prefix = "X-Forwarded-User"
+    mock_settings.identity_sign_claims = False
+    mock_settings.identity_sensitive_attributes = []
+
+
+class TestIdentityPropagationMode:
+    """Each mode sends identity only on its own channel."""
+
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    def test_headers_mode_skips_meta(self, mock_settings):
+        _mode_settings(mock_settings, "headers")
+        uc = UserContext(user_id="alice@example.com", email="alice@example.com")
+        assert build_identity_headers(uc)["X-Forwarded-User-Email"] == "alice@example.com"
+        assert build_identity_meta(uc, {"existing": True}) == {"existing": True}
+
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    def test_meta_mode_skips_headers(self, mock_settings):
+        _mode_settings(mock_settings, "meta")
+        uc = UserContext(user_id="alice@example.com", email="alice@example.com")
+        assert build_identity_headers(uc) == {}
+        assert build_identity_meta(uc, None)["user"]["email"] == "alice@example.com"
+
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    def test_both_mode_sends_both(self, mock_settings):
+        _mode_settings(mock_settings, "both")
+        uc = UserContext(user_id="alice@example.com", email="alice@example.com")
+        assert build_identity_headers(uc)["X-Forwarded-User-Email"] == "alice@example.com"
+        assert build_identity_meta(uc, None)["user"]["email"] == "alice@example.com"
+
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    def test_gateway_mode_overrides_global(self, mock_settings):
+        _mode_settings(mock_settings, "both")
+        uc = UserContext(user_id="alice@example.com", email="alice@example.com")
+        gateway = {"identity_propagation": {"mode": "headers"}}
+        assert build_identity_headers(uc, gateway)["X-Forwarded-User-Email"] == "alice@example.com"
+        assert build_identity_meta(uc, None, gateway) == {}
+
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    def test_meta_mode_returns_existing_meta_untouched_when_disabled(self, mock_settings):
+        _mode_settings(mock_settings, "meta")
+        mock_settings.identity_propagation_enabled = False
+        uc = UserContext(user_id="alice@example.com", email="alice@example.com")
+        assert build_identity_headers(uc) == {}
+        assert build_identity_meta(uc, {"existing": True}) == {"existing": True}
+
+
+class TestToolInvocationIdentityPropagationMode:
+    """invoke_tool honours the mode on the MCP tool path."""
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_headers_mode_sends_no_meta_user(self, mock_settings):
+        _mode_settings(mock_settings, "headers")
+        identity = UserContext(user_id="alice@example.com", email="alice@example.com")
+
+        headers, meta = await TestToolInvocationIdentityPropagationIssue6855()._invoke(user_identity=identity)
+
+        assert headers["X-Forwarded-User-Email"] == "alice@example.com"
+        assert not meta or "user" not in meta
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_meta_mode_sends_no_identity_headers(self, mock_settings):
+        _mode_settings(mock_settings, "meta")
+        identity = UserContext(user_id="alice@example.com", email="alice@example.com")
+
+        headers, meta = await TestToolInvocationIdentityPropagationIssue6855()._invoke(user_identity=identity)
+
+        assert not any(name.startswith("X-Forwarded-User") for name in headers)
+        assert meta["user"]["email"] == "alice@example.com"
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_gateway_mode_override_on_tool_path(self, mock_settings):
+        _mode_settings(mock_settings, "both")
+        identity = UserContext(user_id="alice@example.com", email="alice@example.com")
+
+        headers, meta = await TestToolInvocationIdentityPropagationIssue6855()._invoke(user_identity=identity, gateway_overrides={"identity_propagation": {"mode": "meta"}})
+
+        assert not any(name.startswith("X-Forwarded-User") for name in headers)
+        assert meta["user"]["email"] == "alice@example.com"
