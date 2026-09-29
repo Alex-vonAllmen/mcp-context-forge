@@ -97,6 +97,7 @@ def _make_gateway(**overrides):
         "transport": "sse",
         "tags": [],
         "passthrough_headers": None,
+        "identity_propagation": None,
         "auth_type": None,
         "auth_value": None,
         "auth_headers": None,
@@ -564,6 +565,65 @@ class TestGatewayService:
         db_gateway_call = test_db.add.call_args[0][0]
         assert len(db_gateway_call.tools) == 1
         assert db_gateway_call.tools[0].original_name == "test_tool"
+
+    @pytest.mark.asyncio
+    async def test_register_gateway_with_tools_persists_identity_propagation(self, gateway_service, test_db, monkeypatch):
+        """Per-gateway identity_propagation from GatewayCreate is persisted on registration."""
+        test_db.execute = Mock(
+            side_effect=[
+                _make_execute_result(scalar=None),  # name-conflict check
+                _make_execute_result(scalars_list=[]),  # tool lookup
+            ]
+        )
+        test_db.add = Mock()
+        test_db.commit = Mock()
+        test_db.refresh = Mock()
+
+        # Mock tools returned from gateway
+        # First-Party
+        from mcpgateway.schemas import ToolCreate
+
+        mock_tools = [ToolCreate(name="test_tool", description="A test tool", integration_type="REST", request_type="POST", input_schema={"type": "object"})]
+
+        gateway_service._initialize_gateway = AsyncMock(
+            return_value=(
+                {
+                    "prompts": {"listChanged": True},
+                    "resources": {"listChanged": True},
+                    "tools": {"listChanged": True},
+                },
+                mock_tools,
+                [],
+                [],
+                [],
+            )
+        )
+        gateway_service._notify_gateway_added = AsyncMock()
+
+        mock_model = Mock()
+        mock_model.masked.return_value = mock_model
+        mock_model.name = "tool_gateway"
+
+        monkeypatch.setattr(
+            "mcpgateway.services.gateway_service.GatewayRead.model_validate",
+            lambda x: mock_model,
+        )
+
+        gateway_create = GatewayCreate(
+            name="tool_gateway",
+            url="http://example.com/gateway",
+            description="Gateway with tools",
+            identity_propagation={"enabled": True, "headers_prefix": "X-Sugar-User"},
+        )
+
+        await gateway_service.register_gateway(test_db, gateway_create)
+
+        test_db.add.assert_called_once()
+        # Verify that tools were created and added to the gateway
+        db_gateway_call = test_db.add.call_args[0][0]
+        assert len(db_gateway_call.tools) == 1
+        assert db_gateway_call.tools[0].original_name == "test_tool"
+        assert db_gateway_call.identity_propagation == {"enabled": True, "headers_prefix": "X-Sugar-User"}
 
     @pytest.mark.asyncio
     async def test_register_gateway_preserves_mcp_apps_metadata(self, gateway_service, monkeypatch):
@@ -7958,6 +8018,58 @@ class TestUpdateGatewayAdvanced:
 
         result = await gateway_service.update_gateway(db, mock_gateway.id, update_data)
         assert mock_gateway.passthrough_headers == ["X-Custom", "X-Other"]
+
+    @pytest.mark.asyncio
+    async def test_update_identity_propagation_persisted(self, gateway_service, mock_gateway, monkeypatch):
+        """Per-gateway identity_propagation from the update payload is stored on the gateway."""
+        db = MagicMock()
+        db.execute.return_value = _make_execute_result(scalar=mock_gateway)
+        mock_gateway.auth_type = None
+        mock_gateway.auth_value = {}
+        mock_gateway.auth_query_params = None
+        mock_gateway.version = 1
+        mock_gateway.tags = []
+        mock_gateway.identity_propagation = None
+
+        update_data = _make_gateway(identity_propagation={"enabled": True, "mode": "headers"}, url="http://example.com/gateway")
+        update_data.auth_token = None
+        update_data.auth_password = None
+        update_data.auth_header_value = None
+
+        monkeypatch.setattr("mcpgateway.services.gateway_service.get_for_update", MagicMock(side_effect=[mock_gateway, None]))
+        monkeypatch.setattr("mcpgateway.services.gateway_service._get_registry_cache", lambda: MagicMock(invalidate_gateways=AsyncMock()))
+        monkeypatch.setattr("mcpgateway.services.gateway_service._get_tool_lookup_cache", lambda: MagicMock(invalidate_gateway=AsyncMock()))
+        monkeypatch.setattr("mcpgateway.cache.admin_stats_cache.admin_stats_cache", MagicMock(invalidate_tags=AsyncMock()))
+        monkeypatch.setattr(gateway_service, "_initialize_gateway", AsyncMock(return_value=({"tools": {}}, [], [], [], [])))
+
+        await gateway_service.update_gateway(db, mock_gateway.id, update_data)
+        assert mock_gateway.identity_propagation == {"enabled": True, "mode": "headers"}
+
+    @pytest.mark.asyncio
+    async def test_update_without_identity_propagation_keeps_existing(self, gateway_service, mock_gateway, monkeypatch):
+        """An update that omits identity_propagation leaves the stored override untouched."""
+        db = MagicMock()
+        db.execute.return_value = _make_execute_result(scalar=mock_gateway)
+        mock_gateway.auth_type = None
+        mock_gateway.auth_value = {}
+        mock_gateway.auth_query_params = None
+        mock_gateway.version = 1
+        mock_gateway.tags = []
+        mock_gateway.identity_propagation = {"enabled": True}
+
+        update_data = _make_gateway(url="http://example.com/gateway")
+        update_data.auth_token = None
+        update_data.auth_password = None
+        update_data.auth_header_value = None
+
+        monkeypatch.setattr("mcpgateway.services.gateway_service.get_for_update", MagicMock(side_effect=[mock_gateway, None]))
+        monkeypatch.setattr("mcpgateway.services.gateway_service._get_registry_cache", lambda: MagicMock(invalidate_gateways=AsyncMock()))
+        monkeypatch.setattr("mcpgateway.services.gateway_service._get_tool_lookup_cache", lambda: MagicMock(invalidate_gateway=AsyncMock()))
+        monkeypatch.setattr("mcpgateway.cache.admin_stats_cache.admin_stats_cache", MagicMock(invalidate_tags=AsyncMock()))
+        monkeypatch.setattr(gateway_service, "_initialize_gateway", AsyncMock(return_value=({"tools": {}}, [], [], [], [])))
+
+        await gateway_service.update_gateway(db, mock_gateway.id, update_data)
+        assert mock_gateway.identity_propagation == {"enabled": True}
 
     @pytest.mark.asyncio
     async def test_update_passthrough_headers_string(self, gateway_service, mock_gateway, monkeypatch):

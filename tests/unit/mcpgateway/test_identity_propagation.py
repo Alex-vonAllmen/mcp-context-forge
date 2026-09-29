@@ -2073,8 +2073,12 @@ class TestToolServiceIdentityPropagationCoverage:
                 meta_data={"existing": True},
             )
 
-        mock_build_headers.assert_called_once_with(plugin_global_context.user_context)
-        mock_build_meta.assert_called_once_with(plugin_global_context.user_context, {"existing": True})
+        mock_build_headers.assert_called_once()
+        assert mock_build_headers.call_args.args[0] is plugin_global_context.user_context
+        assert mock_build_headers.call_args.args[1]["id"] == "gw-1"
+        mock_build_meta.assert_called_once()
+        assert mock_build_meta.call_args.args[:2] == (plugin_global_context.user_context, {"existing": True})
+        assert mock_build_meta.call_args.args[2]["id"] == "gw-1"
 
 class TestStreamableHttpTransportIdentityPropagationCoverage:
     """Cover transport identity forwarding branches."""
@@ -2161,3 +2165,323 @@ class TestStreamableHttpTransportIdentityPropagationCoverage:
             user_identity_var.reset(identity_token)
 
         mock_build_headers.assert_called_once_with(identity, gateway)
+
+
+# ---------------------------------------------------------------------------
+# Issue #6855: identity reaches upstream MCP servers on the tool-invocation path
+# ---------------------------------------------------------------------------
+def _mcp_tool_cache_payload(gateway_overrides=None):
+    gateway = {
+        "id": "gw-1",
+        "name": "Gateway",
+        "url": "https://gateway.example.com/mcp",
+        "auth_type": None,
+        "auth_value": None,
+        "auth_query_params": None,
+        "oauth_config": None,
+        "ca_certificate": None,
+        "ca_certificate_sig": None,
+        "passthrough_headers": [],
+    }
+    gateway.update(gateway_overrides or {})
+    return {
+        "status": "active",
+        "tool": {
+            "id": "tool-1",
+            "name": "mcp-tool",
+            "original_name": "mcp-tool",
+            "enabled": True,
+            "reachable": True,
+            "integration_type": "MCP",
+            "request_type": "streamablehttp",
+            "headers": {},
+            "gateway_id": "gw-1",
+        },
+        "gateway": gateway,
+    }
+
+
+class TestToolInvocationIdentityPropagationIssue6855:
+    """End-to-end propagation through ToolService.invoke_tool with the real header builders."""
+
+    async def _invoke(self, *, user_identity=None, plugin_global_context=None, gateway_overrides=None, request_headers=None, global_passthrough=None, header_passthrough=False):
+        # First-Party
+        from mcpgateway.config import settings
+        from mcpgateway.services.tool_service import ToolService
+        from mcpgateway.services.upstream_session_registry import RegistryNotInitializedError
+
+        service = ToolService()
+        service._get_plugin_manager = AsyncMock(return_value=None)
+        service._check_tool_access = AsyncMock(return_value=True)
+        cache = MagicMock()
+        cache.enabled = True
+        cache.get = AsyncMock(return_value=_mcp_tool_cache_payload(gateway_overrides))
+        mock_span = MagicMock()
+        mock_span.__enter__.return_value = MagicMock()
+        mock_span.__exit__.return_value = False
+
+        mock_result = MagicMock(is_error=False, isError=False)
+        mock_result.structured_content = None
+        mock_result.meta = None
+        mock_result.content = []
+        mock_result.model_dump.return_value = {"content": [], "isError": False}
+
+        client_mock = AsyncMock()
+        client_mock.__aenter__ = AsyncMock(return_value=client_mock)
+        client_mock.__aexit__ = AsyncMock(return_value=None)
+        client_mock.call_tool = AsyncMock(return_value=mock_result)
+        client_mock.session = client_mock
+
+        with (
+            patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
+            patch("mcpgateway.services.tool_service.global_config_cache.get_passthrough_headers", return_value=global_passthrough or []),
+            patch("mcpgateway.services.tool_service.create_span", return_value=mock_span),
+            patch("mcpgateway.services.tool_service.create_child_span", return_value=mock_span),
+            patch("mcpgateway.services.tool_service.is_input_capture_enabled", return_value=False),
+            patch("mcpgateway.services.tool_service.inject_trace_context_headers", side_effect=lambda headers: headers),
+            patch("mcpgateway.services.tool_service.mcp_proxy_client", return_value=client_mock) as mock_proxy_client,
+            patch("mcpgateway.services.tool_service.get_upstream_session_registry", side_effect=RegistryNotInitializedError("not init")),
+            patch.object(settings, "enable_header_passthrough", header_passthrough),
+        ):
+            await service.invoke_tool(
+                MagicMock(),
+                name="mcp-tool",
+                arguments={"value": 1},
+                request_headers=request_headers,
+                app_user_email=user_identity.email if user_identity else None,
+                plugin_global_context=plugin_global_context,
+                user_identity=user_identity,
+            )
+
+        return mock_proxy_client.call_args.kwargs["headers"], client_mock.call_tool.call_args.kwargs["meta"]
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_user_identity_reaches_upstream_without_plugin_context(self, mock_settings):
+        """/mcp with plugins disabled: no plugin global context, identity still propagates."""
+        mock_settings.identity_propagation_enabled = True
+        mock_settings.identity_propagation_mode = "both"
+        mock_settings.identity_propagation_headers_prefix = "X-Forwarded-User"
+        mock_settings.identity_sign_claims = False
+        mock_settings.identity_sensitive_attributes = []
+        identity = UserContext(user_id="alice@example.com", email="alice@example.com", teams=["t1"], auth_method="bearer")
+
+        headers, meta = await self._invoke(user_identity=identity)
+
+        assert headers["X-Forwarded-User-Id"] == "alice@example.com"
+        assert headers["X-Forwarded-User-Email"] == "alice@example.com"
+        assert headers["X-Forwarded-User-Teams"] == "t1"
+        assert meta["user"]["email"] == "alice@example.com"
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_user_identity_fills_plugin_context_without_user_context(self, mock_settings):
+        """Plugin context from HTTP_PRE_REQUEST hooks lacks user_context: identity fills the gap."""
+        mock_settings.identity_propagation_enabled = True
+        mock_settings.identity_propagation_mode = "both"
+        mock_settings.identity_propagation_headers_prefix = "X-Forwarded-User"
+        mock_settings.identity_sign_claims = False
+        mock_settings.identity_sensitive_attributes = []
+        identity = UserContext(user_id="alice@example.com", email="alice@example.com")
+        plugin_global_context = GlobalContext(request_id="req-1")
+
+        headers, _ = await self._invoke(user_identity=identity, plugin_global_context=plugin_global_context)
+
+        assert plugin_global_context.user_context is identity
+        assert headers["X-Forwarded-User-Email"] == "alice@example.com"
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_feature_disabled_sends_no_identity(self, mock_settings):
+        """Deny path: IDENTITY_PROPAGATION_ENABLED=false forwards nothing."""
+        mock_settings.identity_propagation_enabled = False
+        identity = UserContext(user_id="alice@example.com", email="alice@example.com")
+
+        headers, meta = await self._invoke(user_identity=identity)
+
+        assert not any(name.startswith("X-Forwarded-User") for name in headers)
+        assert not meta or "user" not in meta
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_unauthenticated_caller_sends_no_identity(self, mock_settings):
+        """Deny path: no authenticated identity means no identity headers."""
+        mock_settings.identity_propagation_enabled = True
+        mock_settings.identity_propagation_mode = "both"
+        mock_settings.identity_propagation_headers_prefix = "X-Forwarded-User"
+
+        headers, meta = await self._invoke(user_identity=None)
+
+        assert not any(name.startswith("X-Forwarded-User") for name in headers)
+        assert not meta or "user" not in meta
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_gateway_override_enables_when_global_disabled(self, mock_settings):
+        """Per-gateway identity_propagation on the cached gateway payload is honoured."""
+        mock_settings.identity_propagation_enabled = False
+        mock_settings.identity_propagation_mode = "both"
+        mock_settings.identity_propagation_headers_prefix = "X-Forwarded-User"
+        mock_settings.identity_sign_claims = False
+        mock_settings.identity_sensitive_attributes = []
+        identity = UserContext(user_id="alice@example.com", email="alice@example.com")
+
+        headers, _ = await self._invoke(user_identity=identity, gateway_overrides={"identity_propagation": {"enabled": True, "headers_prefix": "X-Sugar-User"}})
+
+        assert headers["X-Sugar-User-Email"] == "alice@example.com"
+        assert "X-Forwarded-User-Email" not in headers
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_gateway_override_disables_when_global_enabled(self, mock_settings):
+        """Deny path: a gateway opted out receives no identity even with the global flag on."""
+        mock_settings.identity_propagation_enabled = True
+        mock_settings.identity_propagation_mode = "both"
+        mock_settings.identity_propagation_headers_prefix = "X-Forwarded-User"
+        identity = UserContext(user_id="alice@example.com", email="alice@example.com")
+
+        headers, meta = await self._invoke(user_identity=identity, gateway_overrides={"identity_propagation": {"enabled": False}})
+
+        assert not any(name.startswith("X-Forwarded-User") for name in headers)
+        assert not meta or "user" not in meta
+
+    @pytest.mark.asyncio
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    async def test_client_supplied_identity_header_is_overwritten(self, mock_settings):
+        """A client cannot spoof the identity header through passthrough."""
+        mock_settings.identity_propagation_enabled = True
+        mock_settings.identity_propagation_mode = "both"
+        mock_settings.identity_propagation_headers_prefix = "X-Forwarded-User"
+        mock_settings.identity_sign_claims = False
+        mock_settings.identity_sensitive_attributes = []
+        identity = UserContext(user_id="alice@example.com", email="alice@example.com")
+
+        headers, _ = await self._invoke(
+            user_identity=identity,
+            gateway_overrides={"passthrough_headers": ["X-Forwarded-User-Email"]},
+            request_headers={"x-forwarded-user-email": "ceo@example.com"},
+            global_passthrough=["X-Forwarded-User-Email"],
+            header_passthrough=True,
+        )
+
+        assert headers["X-Forwarded-User-Email"] == "alice@example.com"
+        assert "ceo@example.com" not in headers.values()
+
+
+class TestApplyToolPayloadUserIdentity:
+    """_apply_tool_payload_to_global_context never overwrites an existing user_context."""
+
+    def test_fills_missing_user_context(self):
+        # First-Party
+        from mcpgateway.services.tool_service import _apply_tool_payload_to_global_context
+
+        identity = UserContext(user_id="alice@example.com")
+        ctx = GlobalContext(request_id="req-1")
+        _apply_tool_payload_to_global_context(ctx, "gw-1", "alice@example.com", None, identity)
+        assert ctx.user_context is identity
+
+    def test_preserves_existing_user_context(self):
+        # First-Party
+        from mcpgateway.services.tool_service import _apply_tool_payload_to_global_context
+
+        existing = UserContext(user_id="middleware@example.com")
+        ctx = GlobalContext(request_id="req-1", user_context=existing)
+        _apply_tool_payload_to_global_context(ctx, "gw-1", "alice@example.com", None, UserContext(user_id="alice@example.com"))
+        assert ctx.user_context is existing
+
+    def test_no_identity_leaves_user_context_unset(self):
+        # First-Party
+        from mcpgateway.services.tool_service import _apply_tool_payload_to_global_context
+
+        ctx = GlobalContext(request_id="req-1")
+        _apply_tool_payload_to_global_context(ctx, "gw-1", "alice@example.com", None)
+        assert ctx.user_context is None
+
+
+class TestResolveConfigGatewayPayload:
+    """_resolve_config reads overrides from the cached gateway payload dict."""
+
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    def test_dict_payload_override(self, mock_settings):
+        mock_settings.identity_propagation_enabled = False
+        mock_settings.identity_propagation_mode = "both"
+        mock_settings.identity_propagation_headers_prefix = "X-Forwarded-User"
+        mock_settings.identity_sign_claims = False
+        mock_settings.identity_sensitive_attributes = []
+        cfg = _resolve_config({"id": "gw-1", "identity_propagation": {"enabled": True, "mode": "headers"}})
+        assert cfg["enabled"] is True
+        assert cfg["mode"] == "headers"
+
+    @patch("mcpgateway.utils.identity_propagation.settings")
+    def test_dict_payload_without_key_uses_global(self, mock_settings):
+        mock_settings.identity_propagation_enabled = True
+        mock_settings.identity_propagation_mode = "meta"
+        mock_settings.identity_propagation_headers_prefix = "X-Forwarded-User"
+        mock_settings.identity_sign_claims = False
+        mock_settings.identity_sensitive_attributes = []
+        cfg = _resolve_config({"id": "gw-1"})
+        assert cfg["enabled"] is True
+        assert cfg["mode"] == "meta"
+
+
+class TestStreamableCallToolForwardsIdentity:
+    """/mcp tools/call hands the authenticated caller's identity to invoke_tool."""
+
+    @pytest.mark.asyncio
+    async def test_call_tool_passes_user_identity(self, monkeypatch):
+        # Standard
+        from contextlib import asynccontextmanager
+
+        # First-Party
+        from mcpgateway.transports import streamablehttp_transport as transport
+
+        mock_result = MagicMock()
+        mock_result.content = []
+        mock_result.structured_content = None
+        mock_result.model_dump = lambda by_alias=True: {}
+
+        @asynccontextmanager
+        async def fake_get_db():
+            yield MagicMock()
+
+        user_ctx = {"email": "alice@example.com", "teams": ["t1"], "is_admin": False, "is_authenticated": True, "auth_method": "bearer"}
+        invoke = AsyncMock(return_value=mock_result)
+        monkeypatch.setattr(transport, "get_db", fake_get_db)
+        monkeypatch.setattr(transport, "_get_request_context_or_default", AsyncMock(return_value=("srv-1", {}, user_ctx)))
+        monkeypatch.setattr(transport, "_should_enforce_streamable_rbac", lambda _ctx: False)
+        monkeypatch.setattr(transport.tool_service, "invoke_tool", invoke)
+
+        await transport.call_tool("mytool", {})
+
+        identity = invoke.call_args.kwargs["user_identity"]
+        assert identity.email == "alice@example.com"
+        assert identity.teams == ["t1"]
+        assert identity.is_admin is False
+
+    @pytest.mark.asyncio
+    async def test_call_tool_anonymous_passes_no_identity(self, monkeypatch):
+        # Standard
+        from contextlib import asynccontextmanager
+
+        # First-Party
+        from mcpgateway.transports import streamablehttp_transport as transport
+
+        mock_result = MagicMock()
+        mock_result.content = []
+        mock_result.structured_content = None
+        mock_result.model_dump = lambda by_alias=True: {}
+
+        @asynccontextmanager
+        async def fake_get_db():
+            yield MagicMock()
+
+        anonymous = {"email": None, "teams": [], "is_authenticated": False, "is_admin": False, "auth_method": "anonymous"}
+        invoke = AsyncMock(return_value=mock_result)
+        monkeypatch.setattr(transport, "get_db", fake_get_db)
+        monkeypatch.setattr(transport, "_get_request_context_or_default", AsyncMock(return_value=("srv-1", {}, anonymous)))
+        monkeypatch.setattr(transport, "_should_enforce_streamable_rbac", lambda _ctx: False)
+        monkeypatch.setattr(transport.tool_service, "invoke_tool", invoke)
+
+        await transport.call_tool("mytool", {})
+
+        assert invoke.call_args.kwargs["user_identity"] is None

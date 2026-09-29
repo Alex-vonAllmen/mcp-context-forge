@@ -1693,6 +1693,7 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
             auth_query_params=preparation.auth_query_params_encrypted,
             oauth_config=preparation.oauth_config,
             passthrough_headers=gateway.passthrough_headers,
+            identity_propagation=gateway.identity_propagation,
             tools=[],
             resources=[],
             prompts=[],
@@ -2094,6 +2095,7 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                 auth_query_params=preparation.auth_query_params_encrypted,  # Encrypted query param auth
                 oauth_config=oauth_config,
                 passthrough_headers=gateway.passthrough_headers,
+                identity_propagation=gateway.identity_propagation,
                 tools=db_tools,
                 resources=db_resources,
                 prompts=db_prompts,
@@ -3012,6 +3014,9 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                             raise GatewayError("Invalid passthrough_headers format: must be list[str] or comma-separated string")
 
                     logger.info("Updated passthrough_headers for gateway {gateway.id}: {gateway.passthrough_headers}")
+
+                if gateway_update.identity_propagation is not None:
+                    gateway.identity_propagation = gateway_update.identity_propagation
 
                 # Update team assignment if provided, validating ownership
                 if gateway_update.team_id is not None:
