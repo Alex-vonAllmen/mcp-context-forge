@@ -147,6 +147,7 @@ services:
       - HOST=${GATEWAY_HOST:-0.0.0.0}
       # Transport: sse, streamablehttp, http, or all (default: all)
       - TRANSPORT_TYPE=streamablehttp
+      - GATEWAY_TOOL_NAME_SEPARATOR=${GATEWAY_TOOL_NAME_SEPARATOR:--}
       # High-level Rust MCP UX:
       # Deprecated as of 2026-06-11; sunsets on 2026-07-07. Prefer RUST_MCP_MODE=off and the Python MCP transport.
       #   RUST_MCP_MODE=off    -> Python MCP transport
@@ -398,6 +399,8 @@ services:
       - SSO_KEYCLOAK_ROLE_MAPPINGS=${SSO_KEYCLOAK_ROLE_MAPPINGS:-{}}
       - SSO_KEYCLOAK_DEFAULT_ROLE=${SSO_KEYCLOAK_DEFAULT_ROLE:-}
       - SSO_KEYCLOAK_RESOLVE_TEAM_SCOPE_TO_PERSONAL_TEAM=${SSO_KEYCLOAK_RESOLVE_TEAM_SCOPE_TO_PERSONAL_TEAM:-false}
+      # Accept bearer tokens from a trusted_for_api_auth SSO provider on API/MCP endpoints
+      - SSO_API_TOKEN_AUTH_ENABLED=${SSO_API_TOKEN_AUTH_ENABLED:-false}
       - SSO_AUTO_CREATE_USERS=${SSO_AUTO_CREATE_USERS:-true}
       - SSO_PRESERVE_ADMIN_AUTH=${SSO_PRESERVE_ADMIN_AUTH:-true}
       # Security defaults (tokens require expiration and JTI for revocation)
@@ -1074,6 +1077,7 @@ services:
       dockerfile: Containerfile
     environment:
       - DATABASE_URL=postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-mysecretpassword}@postgres:5432/mcp
+      - GATEWAY_TOOL_NAME_SEPARATOR=${GATEWAY_TOOL_NAME_SEPARATOR:--}
       - "JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set. Run: make setup (first time) or make init-secrets-patch-env (if .env exists)}"
       # Basic auth is DISABLED by default for security (API_ALLOW_BASIC_AUTH unset here)
       # Only set these if you explicitly enable Basic auth for this container

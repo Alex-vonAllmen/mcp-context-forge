@@ -94,7 +94,7 @@ from mcpgateway.db import get_for_update
 from mcpgateway.db import Prompt as DbPrompt
 from mcpgateway.db import PromptMetric
 from mcpgateway.db import Resource as DbResource
-from mcpgateway.db import ResourceMetric, ResourceSubscription
+from mcpgateway.db import resource_has_name_override, ResourceMetric, ResourceSubscription
 from mcpgateway.db import Server as DbServer
 from mcpgateway.db import server_prompt_association, server_resource_association, server_tool_association, SessionLocal
 from mcpgateway.db import Tool as DbTool
@@ -132,7 +132,7 @@ from mcpgateway.services.structured_logger import get_structured_logger
 from mcpgateway.services.team_management_service import TeamManagementService
 from mcpgateway.services.token_exchange_cache import TokenExchangeCache
 from mcpgateway.utils.admin_check import is_admin_bypass_granted
-from mcpgateway.utils.create_slug import slugify
+from mcpgateway.utils.create_slug import build_gateway_tool_invocation_name, slugify
 from mcpgateway.utils.display_name import generate_display_name
 from mcpgateway.utils.internal_http import internal_loopback_base_url
 from mcpgateway.utils.mcp_proxy_client import mcp_proxy_client
@@ -140,9 +140,11 @@ from mcpgateway.utils.pagination import unified_paginate
 from mcpgateway.utils.passthrough_headers import get_passthrough_headers
 from mcpgateway.utils.redis_client import get_redis_client
 from mcpgateway.utils.retry_manager import ResilientHttpClient
+from mcpgateway.utils.safe_jsonschema import warn_unprovable_patterns
 from mcpgateway.utils.services_auth import decode_auth, encode_auth
 from mcpgateway.utils.sqlalchemy_modifier import json_contains_tag_expr
 from mcpgateway.utils.ssl_context_cache import get_cached_ssl_context
+from mcpgateway.utils.ssrf_pinning import resolve_pinned_target, SniPinningTransport as _SniPinningTransport
 from mcpgateway.utils.subject_token import extract_subject_jwt
 from mcpgateway.utils.token_exchange_audit import audit_token_exchange
 from mcpgateway.utils.url_auth import apply_query_param_auth, sanitize_exception_message, sanitize_url_for_logging
@@ -344,6 +346,22 @@ class GatewayError(Exception):
         >>> isinstance(error, Exception)
         True
     """
+
+
+class GatewayToolNameConflictError(GatewayError):
+    """Raised when a federated tool would shadow a tool in its visibility scope."""
+
+    message = "Gateway tool name conflicts with an existing tool"
+
+    def __init__(self, invocation_name: str):
+        """Store only normalized conflicting invocation name for safe diagnostics."""
+        super().__init__(self.message)
+        self.invocation_name = invocation_name
+
+
+def _build_gateway_tool_invocation_name(gateway_name: str, tool_name: str) -> str:
+    """Return gateway-prefixed invocation name using ORM naming semantics."""
+    return build_gateway_tool_invocation_name(gateway_name, tool_name)
 
 
 class GatewayNotFoundError(GatewayError):
@@ -1849,6 +1867,17 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                 initialize_timeout=initialize_timeout,
             )
 
+            tools = [tool for tool in tools if tool is not None]
+            self._validate_tool_name_collisions(
+                db,
+                gateway_name=gateway.name,
+                gateway_id=None,
+                gateway_team_id=team_id,
+                gateway_owner_email=owner_email,
+                gateway_visibility=visibility,
+                tools=tools,
+            )
+
             if gateway.one_time_auth:
                 # For one-time auth, clear auth_type and auth_value after initialization
                 auth_type = "one_time_auth"
@@ -1900,6 +1929,13 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                             visibility=visibility,
                         )
                     )
+                    # Warn after the tool is already in db_tools, not before: this call is
+                    # diagnostic-only and must never be able to remove a tool from federation.
+                    # It shares this try/except with the DbTool construction above, so if it
+                    # ran first, a future change that made it raise would silently drop the
+                    # tool here instead of merely failing to log.
+                    warn_unprovable_patterns(tool.input_schema, source=f"gateway:{preparation.normalized_url}/tool:{tool.name}")
+                    warn_unprovable_patterns(tool.output_schema, source=f"gateway:{preparation.normalized_url}/tool:{tool.name}")
                 except Exception as e:
                     logger.warning("Failed to process tool %s during gateway registration: %s", getattr(tool, "name", "unknown"), e)
                     continue
@@ -1948,7 +1984,11 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                     if lookup_key in orphaned_resources_map:
                         # Update orphaned resource - reassign to new gateway
                         existing = orphaned_resources_map[lookup_key]
-                        existing.name = r.name
+                        has_override = resource_has_name_override(existing)
+                        if existing.original_name != r.name:
+                            existing.original_name = r.name
+                            if not has_override:
+                                existing.custom_name_slug = slugify(r.name)
                         existing.description = r.description
                         existing.mime_type = mime_type
                         existing.uri_template = r.uri_template or None
@@ -2204,6 +2244,12 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
             if validation_errors:
                 logger.warning(f"Gateway '{db_gateway.name}' registered successfully but {len(validation_errors)} tool(s) were skipped due to validation errors: {validation_errors}")
             return gateway_read
+        except* GatewayToolNameConflictError as conflict:  # pragma: no mutate
+            if TYPE_CHECKING:
+                conflict: ExceptionGroup[GatewayToolNameConflictError]
+            db.rollback()
+            logger.warning("Gateway tool name collision during registration: %s", conflict.exceptions[0].invocation_name)
+            raise conflict.exceptions[0]
         except* GatewayConnectionError as ge:  # pragma: no mutate
             if TYPE_CHECKING:
                 ge: ExceptionGroup[GatewayConnectionError]
@@ -2459,12 +2505,22 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                 resources=resources,
                 prompts=prompts,
                 created_via="oauth",
+                stale_created_via_values=MCP_SYNC_CREATED_VIA_VALUES,
             )
+
+            skip_stale_cleanup = not tools and not resources and not prompts
+            if skip_stale_cleanup:
+                logger.warning("Empty catalog from auth_code gateway %s during OAuth fetch, preserving existing items", SecurityValidator.sanitize_log_message(gateway.name))
+
+            # Only prune entries that came from MCP discovery. API/UI and legacy
+            # entries can share the gateway but are not authoritative upstream data.
             reconcile_result = self._reconcile_gateway_catalog(
                 db,
                 gateway=gateway,
                 catalog_sync=catalog_sync,
                 log_context="gateway OAuth fetch",
+                stale_created_via_values=MCP_SYNC_CREATED_VIA_VALUES,
+                skip_stale_cleanup=skip_stale_cleanup,
             )
 
             # Update gateway capabilities and last_seen
@@ -2493,6 +2549,9 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
 
             return {"capabilities": capabilities, "tools": tools, "resources": resources, "prompts": prompts}
 
+        except GatewayToolNameConflictError:
+            db.rollback()
+            raise
         except GatewayConnectionError as gce:
             db.rollback()
             # Surface validation or depth-related failures directly to the user
@@ -2834,6 +2893,23 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
             if gateway.enabled or include_inactive:
                 if getattr(settings, "gateway_async_lifecycle_enabled", False) is True and getattr(gateway, "status", None) == "pending":
                     return self.convert_gateway_to_read(gateway)
+
+                gateway_name_changed = gateway_update.name is not None and gateway_update.name != gateway.name
+                gateway_visibility_changed = gateway_update.visibility is not None and gateway_update.visibility != gateway.visibility
+                if gateway_name_changed or gateway_visibility_changed:
+                    self._validate_tool_name_collisions(
+                        db,
+                        gateway_name=gateway_update.name or gateway.name,
+                        gateway_id=str(gateway.id),
+                        gateway_team_id=gateway.team_id,
+                        gateway_owner_email=gateway.owner_email,
+                        gateway_visibility=gateway_update.visibility or gateway.visibility,
+                        tools=list(gateway.tools),
+                        existing_tools_by_original_name={tool.original_name: tool for tool in gateway.tools},
+                        project_gateway_rename=gateway_name_changed,
+                        project_gateway_visibility=gateway_visibility_changed,
+                        original_gateway_visibility=gateway.visibility,
+                    )
 
                 # Check for name conflicts if name is being changed
                 if gateway_update.name is not None and gateway_update.name != gateway.name:
@@ -3317,6 +3393,7 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                         prompts=prompts,
                         created_via="update",
                         update_visibility=_vis_changed,
+                        project_gateway_rename=gateway_name_changed,
                     )
                     self._reconcile_gateway_catalog(
                         db,
@@ -3336,6 +3413,8 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                     self._active_gateways.discard(gateway.url)
                     self._active_gateways.add(gateway.url)
                     reinit_succeeded = True
+                except GatewayToolNameConflictError:
+                    raise
                 except (GatewayConnectionError, GatewayCredentialError) as gce:
                     if init_affecting_changed:
                         # Do NOT persist the broken update — propagate so the outer handler
@@ -3456,6 +3535,9 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                 return self.convert_gateway_to_read(gateway)
             # Gateway is inactive and include_inactive is False → skip update, return None
             return None
+        except GatewayToolNameConflictError:
+            db.rollback()
+            raise
         except GatewayNameConflictError as ge:
             logger.error("GatewayNameConflictError in group: %s", ge)
             db.rollback()
@@ -3819,6 +3901,7 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
 
             # Update status if it's different
             if (gateway.enabled != activate) or (gateway.reachable != reachable):
+                was_active = gateway.url in self._active_gateways
                 gateway.enabled = activate
                 gateway.reachable = reachable
                 gateway.updated_at = datetime.now(timezone.utc)
@@ -3896,6 +3979,10 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                         register_gateway_capabilities_for_notifications(gateway.id, capabilities)
 
                         gateway.last_seen = datetime.now(timezone.utc)
+                    except GatewayToolNameConflictError:
+                        if not was_active:
+                            self._active_gateways.discard(gateway.url)
+                        raise
                     except Exception as e:
                         logger.warning("Failed to initialize reactivated gateway: %s", e)
                 else:
@@ -4031,6 +4118,9 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
 
             return self.convert_gateway_to_read(gateway)
 
+        except GatewayToolNameConflictError:
+            db.rollback()
+            raise
         except PermissionError as e:
             db.rollback()
 
@@ -4823,8 +4913,11 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         """
         if gateway_enabled and not gateway_reachable:
             logger.info("Reactivating gateway: %s, as it is %s", gateway_name, reactivation_reason)
-            with cast(Any, SessionLocal)() as status_db:
-                await self.set_gateway_state(status_db, gateway_id, activate=True, reachable=True, only_update_reachable=True)
+            try:
+                with cast(Any, SessionLocal)() as status_db:
+                    await self.set_gateway_state(status_db, gateway_id, activate=True, reachable=True, only_update_reachable=True)
+            except GatewayToolNameConflictError:
+                await self._recover_gateway_reachability_after_catalog_conflict(gateway_id, gateway_name)
 
         try:
             with fresh_db_session() as update_db:
@@ -4843,6 +4936,34 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                     update_db.commit()
         except Exception as update_error:
             logger.warning("Failed to update last_seen for gateway %s: %s", gateway_name, update_error)
+
+    async def _recover_gateway_reachability_after_catalog_conflict(self, gateway_id: str, gateway_name: str) -> None:
+        """Restore reachability after health recovery rejects a conflicting catalog refresh.
+
+        Args:
+            gateway_id: Gateway DB identifier.
+            gateway_name: Human-readable gateway name for logs.
+        """
+        now = datetime.now(timezone.utc)
+        with cast(Any, SessionLocal)() as recovery_db:
+            gateway = get_for_update(recovery_db, DbGateway, gateway_id)
+            if gateway is None or not gateway.enabled:
+                recovery_db.rollback()
+                return
+            gateway.reachable = True
+            gateway.last_seen = now
+            gateway.last_error = None
+            gateway.updated_at = now
+            recovery_db.execute(update(DbTool).where(DbTool.gateway_id == gateway_id).where(DbTool.reachable.is_(False)).values(reachable=True, updated_at=now))
+            recovery_db.commit()
+            self._active_gateways.add(gateway.url)
+
+        cache = _get_registry_cache()
+        await cache.invalidate_gateways()
+        await cache.invalidate_tools()
+        tool_lookup_cache = _get_tool_lookup_cache()
+        await tool_lookup_cache.invalidate_gateway(str(gateway_id))
+        logger.warning("Gateway %s recovered, but catalog refresh was rejected because of a tool-name collision", SecurityValidator.sanitize_log_message(gateway_name))
 
     async def _check_single_gateway_health(self, gateway: DbGateway, user_email: Optional[str] = None) -> None:
         """Check health of a single gateway.
@@ -4948,22 +5069,24 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                     httpx2.AsyncClient: Configured HTTPX async client
                 """
                 return httpx2.AsyncClient(
-                    verify=ssl_context if ssl_context else get_default_verify(),
                     follow_redirects=False,
                     headers=headers,
                     timeout=timeout if timeout else get_httpx2_timeout(),
                     auth=auth,
-                    limits=httpx2.Limits(
-                        max_connections=settings.httpx_max_connections,
-                        max_keepalive_connections=settings.httpx_max_keepalive_connections,
-                        keepalive_expiry=settings.httpx_keepalive_expiry,
+                    **pinned_target.client_kwargs(
+                        verify=ssl_context if ssl_context else get_default_verify(),
+                        limits=httpx2.Limits(
+                            max_connections=settings.httpx_max_connections,
+                            max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                            keepalive_expiry=settings.httpx_keepalive_expiry,
+                        ),
                     ),
                 )
 
             # Use isolated client for gateway health checks (each gateway may have custom CA cert)
             # Use admin timeout for health checks (fail fast, don't wait 120s for slow upstreams)
             # Pass ssl_context if present, otherwise let get_isolated_http_client use skip_ssl_verify setting
-            async with get_isolated_http_client(timeout=settings.httpx_admin_read_timeout, verify=ssl_context) as client:
+            async with get_isolated_http_client(timeout=settings.httpx_admin_read_timeout, verify=ssl_context, follow_redirects=False) as client:
                 logger.debug("Checking health of gateway: %s (%s)", gateway_name, gateway_url_sanitized)
                 try:
                     # Handle different authentication types
@@ -4981,7 +5104,7 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                             # are treated as "gateway reachable" (handled below in exception logic).
                             try:
                                 # First-Party
-                                from mcpgateway.services.token_storage_service import build_token_user_context, TokenStorageService  # pylint: disable=import-outside-toplevel
+                                from mcpgateway.services.token_storage_service import TokenStorageService, build_token_user_context  # pylint: disable=import-outside-toplevel
 
                                 # Get user-specific OAuth token only if user_email is provided
                                 if user_email:
@@ -5052,10 +5175,25 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                         # checks self-heal without requiring a manual re-save.
                         headers = {k: SecurityValidator.sanitize_credential_value(v) for k, v in headers.items()}
 
+                    try:
+                        pinned_target = await resolve_pinned_target(gateway_base_url, "Gateway URL")
+                    except ValueError as pin_exc:
+                        if span:
+                            set_span_attribute(span, "health.status", "unhealthy")
+                            set_span_error(span, pin_exc)
+                        await self._handle_gateway_failure(gateway, error=pin_exc, auth_query_params=auth_query_params_decrypted)
+                        return
+
                     # Perform the GET and raise on 4xx/5xx
                     if (gateway_transport).lower() == "sse":
                         timeout = httpx.Timeout(settings.health_check_timeout)
-                        async with client.stream("GET", gateway_url, headers=headers, timeout=timeout) as response:
+                        async with client.stream(
+                            "GET",
+                            pinned_target.pin(gateway_url),
+                            headers=pinned_target.apply_headers(headers),
+                            timeout=timeout,
+                            extensions=pinned_target.extensions,
+                        ) as response:
                             # This will raise immediately if status is 4xx/5xx
                             response.raise_for_status()
                             if span:
@@ -6258,10 +6396,12 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                 if existing_resource:
                     # Update existing resource if there are changes
                     fields_to_update = False
+                    has_override = resource_has_name_override(existing_resource)
+                    upstream_renamed = existing_resource.original_name != resource.name
 
                     upstream_visibility = getattr(resource, "visibility", None)
                     if (
-                        existing_resource.name != resource.name
+                        upstream_renamed
                         or existing_resource.description != resource.description
                         or existing_resource.mime_type != resource.mime_type
                         or existing_resource.uri_template != resource.uri_template
@@ -6272,7 +6412,11 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                         fields_to_update = True
 
                     if fields_to_update:
-                        existing_resource.name = resource.name
+                        setattr(existing_resource, "gateway_name_cache", gateway.name)
+                        if upstream_renamed:
+                            existing_resource.original_name = resource.name
+                            if not has_override:
+                                existing_resource.custom_name_slug = slugify(resource.name)
                         existing_resource.description = resource.description
                         existing_resource.mime_type = resource.mime_type
                         existing_resource.uri_template = resource.uri_template
@@ -6296,6 +6440,7 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                         created_via=created_via,
                         visibility=getattr(resource, "visibility", None) or gateway.visibility,
                     )
+                    db_resource.gateway = gateway
                     resources_to_add.append(db_resource)
                     logger.debug("Created new resource: %s", resource.uri)
             except Exception as e:
@@ -6415,6 +6560,86 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
 
         return prompts_to_add
 
+    def _validate_tool_name_collisions(
+        self,
+        db: Session,
+        *,
+        gateway_name: str,
+        gateway_id: str | None,
+        gateway_team_id: str | None,
+        gateway_owner_email: str | None,
+        gateway_visibility: str,
+        tools: list[Any],
+        existing_tools_by_original_name: dict[str, DbTool] | None = None,
+        update_visibility: bool = False,
+        project_gateway_rename: bool = False,
+        project_gateway_visibility: bool = False,
+        original_gateway_visibility: str | None = None,
+        retained_tool_original_names: set[str] | None = None,
+    ) -> None:
+        """Reject federated tool names that collide in their persisted visibility scope.
+
+        This intentionally mirrors local tool namespace rules.  It is a
+        validation guard, not a replacement for a database uniqueness constraint;
+        concurrent writers remain outside this operation's transaction-level scope.
+        """
+        existing_tools_by_original_name = existing_tools_by_original_name or {}
+        projected: list[tuple[str, str, str | None, str | None]] = []
+        external_conflict_candidates: list[tuple[str, str, str | None, str | None]] = []
+        for tool in tools:
+            original_name = tool.original_name if isinstance(tool, DbTool) else tool.name
+            existing = existing_tools_by_original_name.get(original_name)
+            if existing is not None:
+                if project_gateway_rename:
+                    custom_name_slug = existing.custom_name_slug or slugify(existing.custom_name or existing.original_name)
+                    candidate_name = slugify(gateway_name) + settings.gateway_tool_name_separator + custom_name_slug
+                else:
+                    candidate_name = existing.name
+                visibility = existing.visibility
+                if project_gateway_visibility and visibility == original_gateway_visibility:
+                    visibility = gateway_visibility
+                upstream_visibility = getattr(tool, "visibility", None) if update_visibility else None
+                candidate = (candidate_name, upstream_visibility or visibility, existing.team_id, existing.owner_email)
+                projected.append(candidate)
+                if candidate_name != existing.name or candidate[1] != existing.visibility:
+                    external_conflict_candidates.append(candidate)
+            else:
+                candidate = (
+                    _build_gateway_tool_invocation_name(gateway_name, original_name),
+                    getattr(tool, "visibility", None) or gateway_visibility,
+                    gateway_team_id,
+                    gateway_owner_email,
+                )
+                projected.append(candidate)
+                external_conflict_candidates.append(candidate)
+
+        by_name: dict[str, int] = {}
+        for name, _visibility, _team_id, _owner_email in projected:
+            by_name[name] = by_name.get(name, 0) + 1
+        duplicates = sorted(name for name, count in by_name.items() if count > 1)
+        if duplicates:
+            raise GatewayToolNameConflictError(duplicates[0])
+
+        candidate_names = sorted({name for name, _visibility, _team_id, _owner_email in external_conflict_candidates})
+        if not candidate_names:
+            return
+
+        with db.no_autoflush:
+            matching_tools = db.execute(select(DbTool).where(DbTool.name.in_(candidate_names))).scalars().all()
+
+        for candidate_name, visibility, team_id, owner_email in sorted(external_conflict_candidates, key=lambda item: item[0]):
+            for existing in matching_tools:
+                if gateway_id is not None and str(existing.gateway_id) == str(gateway_id) and (not retained_tool_original_names or existing.original_name not in retained_tool_original_names):
+                    continue
+                if existing.name != candidate_name:
+                    continue
+                if visibility == "public" and existing.visibility == "public":
+                    raise GatewayToolNameConflictError(candidate_name)
+                if visibility == "team" and team_id and existing.visibility == "team" and existing.team_id == team_id:
+                    raise GatewayToolNameConflictError(candidate_name)
+                if visibility == "private" and owner_email and existing.visibility == "private" and existing.owner_email == owner_email:
+                    raise GatewayToolNameConflictError(candidate_name)
+
     def _sync_gateway_catalog(
         self,
         db: Session,
@@ -6427,8 +6652,33 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         update_visibility: bool = False,
         include_resources: bool = True,
         include_prompts: bool = True,
+        project_gateway_rename: bool = False,
+        stale_created_via_values: Optional[Set[str]] = None,
     ) -> GatewayCatalogSyncResult:
         """Update/create fetched catalog rows inside caller transaction."""
+        tools = [tool for tool in tools if tool is not None]
+        existing_tools_by_original_name = {tool.original_name: tool for tool in gateway.tools}
+        fetched_tool_names = {tool.name for tool in tools}
+        # Match the caller's pruning policy: retained local aliases must still
+        # participate in namespace validation, unlike stale discovered tools.
+        retained_tool_original_names = {
+            tool.original_name
+            for tool in gateway.tools
+            if stale_created_via_values is not None and tool.original_name not in fetched_tool_names and getattr(tool, "created_via", None) not in stale_created_via_values
+        }
+        self._validate_tool_name_collisions(
+            db,
+            gateway_name=gateway.name,
+            gateway_id=str(gateway.id),
+            gateway_team_id=gateway.team_id,
+            gateway_owner_email=gateway.owner_email,
+            gateway_visibility=gateway.visibility,
+            tools=tools,
+            existing_tools_by_original_name=existing_tools_by_original_name,
+            update_visibility=update_visibility,
+            project_gateway_rename=project_gateway_rename,
+            retained_tool_original_names=retained_tool_original_names,
+        )
         return GatewayCatalogSyncResult(
             new_tool_names=[tool.name for tool in tools],
             new_resource_uris=[resource.uri for resource in resources] if include_resources else None,
@@ -7235,9 +7485,44 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         if validation_warnings is None:
             validation_warnings = []
 
+        try:
+            pinned_target = await resolve_pinned_target(server_url, "Gateway URL")
+        except ValueError as exc:
+            raise GatewayConnectionError(f"Outbound gateway URL blocked by URL policy: {sanitize_url_for_logging(server_url)}") from exc
+
+        def get_httpx_client_factory(
+            headers: dict[str, str] | None = None,
+            timeout: httpx2.Timeout | None = None,
+            auth: httpx2.Auth | None = None,
+        ) -> httpx2.AsyncClient:
+            """Build the SDK's httpx client so it dials the address pinned at validation time.
+
+            Args:
+                headers: Optional headers for the client
+                timeout: Optional timeout for the client
+                auth: Optional auth for the client
+
+            Returns:
+                httpx2.AsyncClient: Configured HTTPX async client
+            """
+            return httpx2.AsyncClient(
+                follow_redirects=False,
+                headers=headers,
+                timeout=timeout if timeout else get_httpx2_timeout(),
+                auth=auth,
+                **pinned_target.client_kwargs(
+                    verify=get_default_verify(),
+                    limits=httpx2.Limits(
+                        max_connections=settings.httpx_max_connections,
+                        max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                        keepalive_expiry=settings.httpx_keepalive_expiry,
+                    ),
+                ),
+            )
+
         # Client auto-initializes on entry; no manual initialize() needed.
         try:
-            async with mcp_proxy_client(url=server_url, headers=authentication, transport="sse") as client:
+            async with mcp_proxy_client(url=server_url, headers=authentication, httpx_client_factory=get_httpx_client_factory, transport="sse") as client:
                 # Read negotiated capabilities from the auto-initialized session
                 capabilities = client.server_capabilities.model_dump(by_alias=True, exclude_none=True)
                 logger.debug("Server capabilities: %s", capabilities)
@@ -7374,6 +7659,11 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         if authentication is None:
             authentication = {}
 
+        try:
+            pinned_target = await resolve_pinned_target(server_url, "Gateway URL")
+        except ValueError as exc:
+            raise GatewayConnectionError(f"Outbound gateway URL blocked by URL policy: {sanitize_url_for_logging(server_url)}") from exc
+
         def get_httpx_client_factory(
             headers: dict[str, str] | None = None,
             timeout: httpx2.Timeout | None = None,
@@ -7397,15 +7687,17 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                 ctx = None
 
             return httpx2.AsyncClient(
-                verify=ctx if ctx else get_default_verify(),
                 follow_redirects=False,
                 headers=headers,
                 timeout=timeout if timeout else get_httpx2_timeout(),
                 auth=auth,
-                limits=httpx2.Limits(
-                    max_connections=settings.httpx_max_connections,
-                    max_keepalive_connections=settings.httpx_max_keepalive_connections,
-                    keepalive_expiry=settings.httpx_keepalive_expiry,
+                **pinned_target.client_kwargs(
+                    verify=ctx if ctx else get_default_verify(),
+                    limits=httpx2.Limits(
+                        max_connections=settings.httpx_max_connections,
+                        max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                        keepalive_expiry=settings.httpx_keepalive_expiry,
+                    ),
                 ),
             )
 
@@ -7537,6 +7829,11 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         if authentication is None:
             authentication = {}
 
+        try:
+            pinned_target = await resolve_pinned_target(server_url, "Gateway URL")
+        except ValueError as exc:
+            raise GatewayConnectionError(f"Outbound gateway URL blocked by URL policy: {sanitize_url_for_logging(server_url)}") from exc
+
         # Use authentication directly instead
         def get_httpx_client_factory(
             headers: dict[str, str] | None = None,
@@ -7561,15 +7858,17 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                 ctx = None
 
             return httpx2.AsyncClient(
-                verify=ctx if ctx else get_default_verify(),
                 follow_redirects=False,
                 headers=headers,
                 timeout=timeout if timeout else get_httpx2_timeout(),
                 auth=auth,
-                limits=httpx2.Limits(
-                    max_connections=settings.httpx_max_connections,
-                    max_keepalive_connections=settings.httpx_max_keepalive_connections,
-                    keepalive_expiry=settings.httpx_keepalive_expiry,
+                **pinned_target.client_kwargs(
+                    verify=ctx if ctx else get_default_verify(),
+                    limits=httpx2.Limits(
+                        max_connections=settings.httpx_max_connections,
+                        max_keepalive_connections=settings.httpx_max_keepalive_connections,
+                        keepalive_expiry=settings.httpx_keepalive_expiry,
+                    ),
                 ),
             )
 
@@ -7676,48 +7975,6 @@ _HANDSHAKE_PROTOCOL_COPY = (
     "The server responded but MCP negotiation failed. Confirm the URL points at an MCP endpoint (for example /mcp or /sse) and supports an MCP protocol this gateway understands."
 )
 _HANDSHAKE_INVALID_COPY = "The server's response is not valid MCP. The URL may point at a service that does not speak MCP."
-
-
-class _SniPinningTransport(httpx2.AsyncHTTPTransport):
-    """Dial a DNS-pinned address while keeping the request's hostname authority and TLS identity.
-
-    The MCP SDK compares the origin it connected to against the origin the
-    server advertises (``mcp.client.sse`` raises on a mismatch), so pinning has
-    to happen below the SDK: requests keep the validated hostname in their URL
-    and ``Host`` header, while every connection goes to the address resolved at
-    validation time and TLS is verified against that hostname. Built on httpx2
-    because the SDK 2.0 client transports run on that stack.
-    """
-
-    def __init__(self, sni_hostname: str, pinned_host: str, **kwargs: Any) -> None:
-        """Record the validated hostname and the address to dial in its place.
-
-        Args:
-            sni_hostname: Validated hostname whose certificate must match.
-            pinned_host: Address resolved at validation time, dialled instead of re-resolving.
-            **kwargs: Forwarded to ``httpx2.AsyncHTTPTransport``.
-        """
-        super().__init__(**kwargs)
-        self._sni_hostname = sni_hostname
-        self._pinned_host = pinned_host
-
-    async def handle_async_request(self, request: "httpx2.Request") -> "httpx2.Response":
-        """Send the request to the pinned address with TLS pinned to the validated hostname.
-
-        Args:
-            request: Outbound request addressed to the validated hostname.
-
-        Returns:
-            httpx2.Response: The upstream response.
-
-        Raises:
-            httpx2.UnsupportedProtocol: If the request targets any other host.
-        """
-        if request.url.raw_host.decode("ascii") != self._sni_hostname:
-            raise httpx2.UnsupportedProtocol(f"Gateway test refused a request to unvalidated host {request.url.host}", request=request)
-        request.extensions.setdefault("sni_hostname", self._sni_hostname)
-        request.url = request.url.copy_with(host=self._pinned_host)
-        return await super().handle_async_request(request)
 
 
 def _gateway_test_visibility_filters(db: Session, user: Any) -> List[Any]:
@@ -8234,7 +8491,7 @@ async def test_gateway_connectivity(
                 # For Authorization Code flow, try to get stored tokens
                 try:
                     # First-Party
-                    from mcpgateway.services.token_storage_service import build_token_user_context, TokenStorageService  # pylint: disable=import-outside-toplevel
+                    from mcpgateway.services.token_storage_service import TokenStorageService, build_token_user_context  # pylint: disable=import-outside-toplevel
 
                     # SECURITY: Use token_teams from the authenticated user dict — this is
                     # already resolved by auth middleware and must not be widened by
@@ -8542,7 +8799,7 @@ async def test_gateway_handshake(
             auth=auth,
             transport=_SniPinningTransport(
                 sni_hostname=validated_hostname,
-                pinned_host=target["resolved_ip"],
+                pinned_hosts=[target["resolved_ip"]],
                 verify=handshake_verify,
                 limits=httpx2.Limits(
                     max_connections=settings.httpx_max_connections,
