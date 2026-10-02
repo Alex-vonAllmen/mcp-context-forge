@@ -942,6 +942,7 @@ class TestGatewayService:
         test_db.execute = Mock(
             side_effect=[
                 _make_execute_result(scalar=None),  # name-conflict check
+                _make_execute_result(scalars_list=[]),  # federated tool collision check
                 _make_execute_result(scalars_list=[]),  # tool lookup
             ]
         )
